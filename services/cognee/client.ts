@@ -196,11 +196,13 @@ class MockCogneeClient implements MemoryClient {
 class LiveCogneeClient implements MemoryClient {
   private baseUrl: string;
   private apiKey: string;
+  private tenantId: string;
   private dataset: string;
 
   constructor() {
     const url = process.env.COGNEE_SERVICE_URL;
     const apiKey = process.env.COGNEE_API_KEY;
+    const tenantId = process.env.COGNEE_TENANT_ID;
     if (!url) {
       throw new Error(
         "COGNEE_SERVICE_URL is not set. Point it at your running Cognee server " +
@@ -209,13 +211,19 @@ class LiveCogneeClient implements MemoryClient {
     }
     if (!apiKey) {
       throw new Error(
-        "COGNEE_API_KEY is not set. Create an agent identity via POST " +
-          "/api/v1/agents/create on your Cognee server and use the returned " +
-          "agentApiKey here (see README)."
+        "COGNEE_API_KEY is not set (see README for how to get one from your " +
+          "Cognee server)."
+      );
+    }
+    if (!tenantId) {
+      throw new Error(
+        "COGNEE_TENANT_ID is not set. Your Cognee server issues this alongside " +
+          "your API key — see README."
       );
     }
     this.baseUrl = url.replace(/\/$/, "");
     this.apiKey = apiKey;
+    this.tenantId = tenantId;
     this.dataset = process.env.COGNEE_DATASET_NAME || "memcore";
   }
 
@@ -223,7 +231,8 @@ class LiveCogneeClient implements MemoryClient {
     const res = await fetch(`${this.baseUrl}${path}`, {
       ...init,
       headers: {
-        Authorization: `Bearer ${this.apiKey}`,
+        "X-Api-Key": this.apiKey,
+        "X-Tenant-Id": this.tenantId,
         ...init?.headers,
       },
       // Cognee's cognify/search calls hit an LLM and can take a while.
@@ -253,22 +262,36 @@ class LiveCogneeClient implements MemoryClient {
   }
 
   async search(query: string, limit = 8): Promise<MemorySearchResult[]> {
-    // CHUNKS returns raw relevant text passages — the closest match to
-    // MemCore's "memory card" list view.
+    // CHUNKS returns one object PER DATASET, and each of those objects'
+    // `search_result` is itself an ARRAY of chunk objects
+    // ({ id, text, document_name, chunk_index, created_at, ... }) — not a
+    // single string. Confirmed against a live instance on
+    // 2026-07-06. Flatten across datasets and chunks before mapping.
     const results = await this.searchRaw("CHUNKS", query, limit);
 
-    return results.map((r, i) => {
-      const text =
-        typeof r.search_result === "string" ? r.search_result : JSON.stringify(r.search_result);
+    interface CogneeChunk {
+      id?: string;
+      text?: string;
+      document_name?: string;
+      created_at?: number;
+    }
+
+    const chunks = results.flatMap((r) => {
+      const items = Array.isArray(r.search_result) ? (r.search_result as CogneeChunk[]) : [];
+      return items.map((chunk) => ({ chunk, datasetName: r.dataset_name }));
+    });
+
+    return chunks.slice(0, limit).map(({ chunk, datasetName }, i) => {
+      const text = chunk.text ?? "";
       return {
-        id: `live-${i}`,
+        id: chunk.id ?? `live-${i}`,
         type: "document",
-        title: text.slice(0, 60),
+        title: chunk.document_name ?? text.slice(0, 60),
         summary: text,
         excerpt: text,
-        timestamp: new Date().toISOString(),
-        source: r.dataset_name,
-        relevance: 1 - i / Math.max(results.length, 1),
+        timestamp: chunk.created_at ? new Date(chunk.created_at).toISOString() : new Date().toISOString(),
+        source: datasetName,
+        relevance: 1 - i / Math.max(chunks.length, 1),
       };
     });
   }
@@ -281,10 +304,19 @@ class LiveCogneeClient implements MemoryClient {
     const [completion] = await this.searchRaw("GRAPH_COMPLETION", question, 1);
     const sources = await this.search(question, 4);
 
+    // GRAPH_COMPLETION's search_result was a plain string in our CHUNKS
+    // test of the wrapper shape, but we haven't independently confirmed
+    // GRAPH_COMPLETION itself yet — given CHUNKS turned out to be
+    // array-wrapped when we assumed it wasn't, handle that case here too
+    // rather than assuming. Verify with a plain curl call if this still
+    // looks wrong once you test it.
+    const raw = completion?.search_result;
     const answer =
-      completion && typeof completion.search_result === "string"
-        ? completion.search_result
-        : "No connected memories match that question yet.";
+      typeof raw === "string"
+        ? raw
+        : Array.isArray(raw) && typeof raw[0] === "string"
+          ? raw[0]
+          : "No connected memories match that question yet.";
 
     return {
       question,
@@ -298,48 +330,67 @@ class LiveCogneeClient implements MemoryClient {
   }
 
   async getGraph(): Promise<KnowledgeGraph> {
-    // Cognee doesn't expose a single "give me the entire graph" REST
-    // endpoint — INSIGHTS returns the subgraph most relevant to a query,
-    // as [sourceNode, relationship, targetNode] triplets. A broad, generic
-    // query with a high top_k approximates "the whole graph" for small
-    // demo datasets; for larger ones, wire this to a specific query
-    // instead (e.g. whatever the user just searched for).
-    const triplets = await this.searchRaw("INSIGHTS", this.dataset, 100);
+    // Cognee has a dedicated endpoint for this — GET
+    // /api/v1/datasets/{dataset_id}/graph — confirmed live on 2026-07-06,
+    // returning { nodes: [{id, label, type, properties}], edges: [{source,
+    // target, label}] }. Far more reliable than trying to coax graph data
+    // out of /search (INSIGHTS isn't a real search type on this server,
+    // and TRIPLET_COMPLETION returns an LLM-generated sentence, not
+    // structured data — both dead ends, don't reintroduce them).
+    //
+    // The endpoint needs a dataset ID, but this client only knows the
+    // dataset NAME (this.dataset). GET /api/v1/datasets returned an empty
+    // response when tested against this tenant, so instead we piggyback on
+    // a cheap CHUNKS search — its response wrapper already includes
+    // `dataset_id` right next to `dataset_name` (confirmed live) — rather
+    // than depending on an endpoint that isn't reliably working here.
+    const probe = await this.searchRaw("CHUNKS", this.dataset, 1);
+    const datasetEntry = probe[0] as { dataset_id?: string } | undefined;
+    if (!datasetEntry?.dataset_id) {
+      // Nothing ingested under this dataset name yet.
+      return { nodes: [], edges: [] };
+    }
 
-    const nodesById = new Map<string, MemoryNode>();
-    const edges: KnowledgeGraph["edges"] = [];
+    interface CogneeGraphNode {
+      id: string;
+      label: string;
+      type?: string;
+      properties?: Record<string, unknown>;
+    }
+    interface CogneeGraphEdge {
+      source: string;
+      target: string;
+      label: string;
+    }
 
-    triplets.forEach((t) => {
-      const triplet = t.search_result as
-        | [Record<string, unknown>, Record<string, unknown>, Record<string, unknown>]
-        | undefined;
-      if (!Array.isArray(triplet) || triplet.length < 3) return;
-      const [source, relation, target] = triplet;
+    const graph = await this.call<{ nodes: CogneeGraphNode[]; edges: CogneeGraphEdge[] }>(
+      `/api/v1/datasets/${datasetEntry.dataset_id}/graph`
+    );
 
-      const toNode = (n: Record<string, unknown>): MemoryNode => {
-        const id = String(n.id ?? n.name ?? JSON.stringify(n));
-        return {
-          id,
-          type: "document",
-          title: String(n.name ?? n.type ?? id),
-          summary: String(n.description ?? n.type ?? ""),
-          timestamp: new Date().toISOString(),
-          source: "Cognee",
-        };
+    // Cognee's raw nodes are auto-extracted entities/chunks/summaries, not
+    // MemCore's tidy demo types — that's expected (see README). Some node
+    // labels are synthetic IDs (e.g. "TextSummary_ab862159-...") rather
+    // than readable text, so prefer the node's own text/description
+    // property for the title when present, and fall back to the label
+    // (which IS readable for Entity nodes, e.g. "postgresql", "alice").
+    const toNode = (n: CogneeGraphNode): MemoryNode => {
+      const props = n.properties ?? {};
+      const text = typeof props.text === "string" ? props.text : undefined;
+      const description = typeof props.description === "string" ? props.description : undefined;
+      return {
+        id: n.id,
+        type: "document",
+        title: text ? (text.length > 60 ? `${text.slice(0, 60)}…` : text) : n.label,
+        summary: text ?? description ?? n.type ?? "",
+        timestamp: new Date().toISOString(),
+        source: "Cognee",
       };
+    };
 
-      const sourceNode = toNode(source);
-      const targetNode = toNode(target);
-      nodesById.set(sourceNode.id, sourceNode);
-      nodesById.set(targetNode.id, targetNode);
-      edges.push({
-        from: sourceNode.id,
-        to: targetNode.id,
-        relation: String(relation?.relationship_name ?? "related to"),
-      });
-    });
-
-    return { nodes: Array.from(nodesById.values()), edges };
+    return {
+      nodes: graph.nodes.map(toNode),
+      edges: graph.edges.map((e) => ({ from: e.source, to: e.target, relation: e.label })),
+    };
   }
 
   async getTimeline(): Promise<TimelineGroup[]> {
@@ -386,7 +437,7 @@ class LiveCogneeClient implements MemoryClient {
 
     const res = await fetch(`${this.baseUrl}/api/v1/remember`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${this.apiKey}` },
+      headers: { "X-Api-Key": this.apiKey, "X-Tenant-Id": this.tenantId },
       body: form,
       cache: "no-store",
     });
