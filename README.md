@@ -1,6 +1,6 @@
 # MemCore
 
-**The core of your team's collective memory.**
+**The core of your team's collective memory**
 
 Instead of digging through Slack, GitHub, Notion, and a dozen docs to remember *why* a decision was made, MemCore builds one connected knowledge graph out of everything your team discusses — so you can ask a plain-language question and get back not just **what** happened, but **why**.
 
